@@ -2,12 +2,12 @@ import os
 from dotenv import load_dotenv
 import logging
 
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 def load_env():
     load_dotenv()
     gmail = os.getenv("GMAIL")
-    app_password = os.getenv("APP_PASSKEY")  # safer naming
+    app_password = os.getenv("APP_PASSKEY")
 
     if not gmail or not app_password:
         logging.error("Error loading environment variables")
@@ -19,5 +19,6 @@ def load_env():
             'GMAIL="your_email@gmail.com"\n'
             'APP_PASSKEY="your_app_password"'
         )
-
+    
+    logger.info("Credentials loaded for: %s", gmail)
     return gmail, app_password

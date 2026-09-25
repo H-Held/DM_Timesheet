@@ -1,9 +1,25 @@
-.venv
-*.env
+# Virtual environment
+.venv/
+
+# Editor settings
+.vscode/
+
+# Python caches
 __pycache__/
 *.pyc
 *.pyo
+
+# Secrets & generated tokens — NEVER commit these
+*.env
+credentials.json
+token.pickle
+
+# Downloaded documents & generated output
 *.pdf
 *.html
-*.log
 *.csv
+*.log
+
+# PyInstaller build output
+build/
+dist/

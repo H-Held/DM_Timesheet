@@ -64,17 +64,21 @@ class GmailReader:
     # Search emails
     # ──────────────────────────────────────────
 
-    def search_emails(self, sender: str, label: str = None) -> list[tuple]:
+    def search_emails(self, sender: str, subject: str = None, label: str = None) -> list[tuple]:
         """
-        Searches for emails from a specific sender.
+        Searches for emails from a specific sender, optionally filtered by subject.
+
+        Uses IMAP UIDs (not sequence numbers) so results stay valid even after
+        expunge() is called during processing.
 
         Args:
-            sender: Sender email address.
-            label:  Folder/label to search. None = all folders.
-                    Use "INBOX" to avoid duplicates.
+            sender:  Sender email address.
+            subject: Required subject text (IMAP SUBJECT filter). None = no filter.
+            label:   Folder/label to search. None = all folders.
 
         Returns:
-            List of (folder, email_id) tuples.
+            List of (folder, uid_bytes) tuples.
+            uid_bytes is a UID string encoded as bytes, e.g. b'1234'.
         """
         if not self.mail:
             logger.error("Not connected! Call connect() first.")
@@ -86,8 +90,12 @@ class GmailReader:
         else:
             logger.info("Searching in folder: '%s'", label)
 
-        search_criteria = f'(FROM "{sender}")'
-        all_results     = []
+        criteria = [f'FROM "{sender}"']
+        if subject:
+            criteria.append(f'SUBJECT "{subject}"')
+        search_criteria = "(" + " ".join(criteria) + ")"
+        logger.debug("IMAP search criteria: %s", search_criteria)
+        all_results = []
 
         for folder in folders:
             status, _ = self._select(folder, readonly=True)
@@ -95,14 +103,15 @@ class GmailReader:
                 logger.debug("Skipping folder '%s'.", folder)
                 continue
 
-            status, data = self.mail.search(None, search_criteria)
+            # UID SEARCH instead of plain SEARCH — UIDs never shift after expunge
+            status, data = self.mail.uid("search", None, search_criteria)
             if status != "OK" or not data[0]:
                 continue
 
-            ids = data[0].split()
-            logger.info("  '%s': %d match(es)", folder, len(ids))
-            for email_id in ids:
-                all_results.append((folder, email_id))
+            uids = data[0].split()
+            logger.info("  '%s': %d match(es)", folder, len(uids))
+            for uid in uids:
+                all_results.append((folder, uid))
 
         logger.info("Total: %d email(s) found.", len(all_results))
         return all_results
@@ -111,11 +120,12 @@ class GmailReader:
     # Metadata
     # ──────────────────────────────────────────
 
-    def get_email_metadata(self, folder: str, email_id: bytes) -> dict:
-        """Fetches date, subject and read/unread status (no body download)."""
+    def get_email_metadata(self, folder: str, email_uid: bytes) -> dict:
+        """Fetches date, subject and read/unread status via UID (no body download)."""
         self._select(folder, readonly=True)
-        status, data = self.mail.fetch(email_id, "(FLAGS ENVELOPE)")
-        if status != "OK":
+        status, data = self.mail.uid("fetch", email_uid, "(FLAGS ENVELOPE)")
+        if status != "OK" or not data or data[0] is None:
+            logger.warning("Could not fetch metadata for UID %s in '%s'.", email_uid.decode(), folder)
             return {}
 
         raw     = data[0].decode()
@@ -123,7 +133,7 @@ class GmailReader:
         parts   = raw.split('"')
 
         return {
-            "id":      email_id.decode(),
+            "id":      email_uid.decode(),
             "folder":  folder,
             "date":    parts[1] if len(parts) > 1 else "unknown",
             "subject": parts[3] if len(parts) > 3 else "unknown",
@@ -138,17 +148,17 @@ class GmailReader:
     # Important: select WITHOUT readonly=True to allow changes.
     # ──────────────────────────────────────────
 
-    def mark_as_read(self, folder: str, email_id: bytes):
+    def mark_as_read(self, folder: str, email_uid: bytes):
         """Marks an email as read (adds \\Seen flag)."""
-        self._select(folder, readonly=False)  # must NOT be readonly to modify
-        self.mail.store(email_id, "+FLAGS", "\\Seen")
-        logger.info("Marked as READ — folder: %s | ID: %s", folder, email_id.decode())
+        self._select(folder, readonly=False)
+        self.mail.uid("store", email_uid, "+FLAGS", "\\Seen")
+        logger.info("Marked as READ — folder: %s | UID: %s", folder, email_uid.decode())
 
-    def mark_as_unread(self, folder: str, email_id: bytes):
+    def mark_as_unread(self, folder: str, email_uid: bytes):
         """Marks an email as unread (removes \\Seen flag)."""
         self._select(folder, readonly=False)
-        self.mail.store(email_id, "-FLAGS", "\\Seen")
-        logger.info("Marked as UNREAD — folder: %s | ID: %s", folder, email_id.decode())
+        self.mail.uid("store", email_uid, "-FLAGS", "\\Seen")
+        logger.info("Marked as UNREAD — folder: %s | UID: %s", folder, email_uid.decode())
 
     # ──────────────────────────────────────────
     # Gmail Labels
@@ -177,10 +187,10 @@ class GmailReader:
             logger.info("Label created: '%s'", label_name)
             return True
         else:
-            logger.warning("Could not create label '%s' (may already exist).", label_name)
+            logger.debug("Label '%s' not created (already exists or IMAP refused).", label_name)
             return False
 
-    def add_label(self, folder: str, email_id: bytes, label_name: str):
+    def add_label(self, folder: str, email_uid: bytes, label_name: str):
         """
         Adds a Gmail label to an email by copying it into that label's folder.
 
@@ -189,39 +199,43 @@ class GmailReader:
 
         Args:
             folder:     Current folder of the email (e.g. "INBOX").
-            email_id:   Email ID as bytes.
+            email_uid:  Email UID as bytes.
             label_name: Label to add (e.g. "dm_processed").
         """
         self._select(folder, readonly=False)
-        status, _ = self.mail.copy(email_id, f'"{label_name}"')
+        status, _ = self.mail.uid("copy", email_uid, f'"{label_name}"')
         if status == "OK":
             logger.info(
-                "Label '%s' added — folder: %s | ID: %s",
-                label_name, folder, email_id.decode(),
+                "Label '%s' added — folder: %s | UID: %s",
+                label_name, folder, email_uid.decode(),
             )
         else:
             logger.warning("Could not add label '%s'. Does it exist?", label_name)
 
-    def remove_label(self, label_name: str, email_id: bytes):
+    def remove_label(self, label_name: str, email_uid: bytes):
         """
         Removes a Gmail label from an email by deleting it from that label's folder.
 
         This does NOT delete the email — it only removes the label.
-        The email stays in INBOX and any other labels it has.
+        The email stays in any other labels it has.
+
+        Uses UID STORE so the correct message is targeted even if other messages
+        were expunged earlier in the same session (sequence numbers would have shifted).
 
         Args:
-            label_name: Label to remove (e.g. "dm_processed").
-            email_id:   Email ID as bytes.
+            label_name: Label to remove (e.g. "INBOX" or "dm_processed").
+            email_uid:  Email UID as bytes — must be the UID valid in label_name's folder.
         """
-        # Select the label folder and mark for deletion, then expunge
         status, _ = self._select(label_name, readonly=False)
         if status != "OK":
             logger.warning("Could not open label '%s'.", label_name)
             return
 
-        self.mail.store(email_id, "+FLAGS", "\\Deleted")
+        # After selecting the new folder the UID is the same (Gmail uses global UIDs
+        # per-message across labels), so uid("store") hits the right message.
+        self.mail.uid("store", email_uid, "+FLAGS", "\\Deleted")
         self.mail.expunge()
-        logger.info("Label '%s' removed from email %s.", label_name, email_id.decode())
+        logger.info("Label '%s' removed from UID %s.", label_name, email_uid.decode())
 
     def list_labels(self) -> list[str]:
         """
@@ -245,18 +259,19 @@ class GmailReader:
     ) -> list[dict]:
         """
         Loads a named attachment from emails directly into RAM (no disk write).
+        Uses UID FETCH to stay stable across expunge() calls.
 
         Returns:
             List of {"filename": str, "data": io.BytesIO}
         """
         found = []
 
-        for folder, email_id in email_results:
+        for folder, email_uid in email_results:
             self._select(folder, readonly=True)
 
-            status, msg_data = self.mail.fetch(email_id, "(RFC822)")
-            if status != "OK":
-                logger.warning("Could not fetch email %s.", email_id)
+            status, msg_data = self.mail.uid("fetch", email_uid, "(RFC822)")
+            if status != "OK" or not msg_data or msg_data[0] is None:
+                logger.warning("Could not fetch email UID %s.", email_uid)
                 continue
 
             msg     = email.message_from_bytes(msg_data[0][1])
@@ -275,7 +290,7 @@ class GmailReader:
 
                 buffer = io.BytesIO(part.get_payload(decode=True))
                 buffer.seek(0)
-                logger.info("✓ '%s' loaded into RAM (%d bytes)", filename, buffer.getbuffer().nbytes)
+                logger.info("[OK] '%s' loaded into RAM (%d bytes)", filename, buffer.getbuffer().nbytes)
                 found.append({"filename": filename, "data": buffer})
 
         if not found:

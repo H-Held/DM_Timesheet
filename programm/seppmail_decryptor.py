@@ -1,9 +1,12 @@
+import os
 import re
 import requests
 import logging
 from dataclasses import dataclass
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
+
+import file_organizer
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +86,6 @@ def decrypt_secure_email(html_bytes: bytes, password: str) -> SEPPMailResult:
 def parse_attachments(result: SEPPMailResult) -> list[dict]:
     """
     Parses all individual PDF attachments from the decrypted email.
-
     Skips the "Alle Anhänge herunterladen" ZIP button (path=all).
 
     Returns:
@@ -99,13 +101,11 @@ def parse_attachments(result: SEPPMailResult) -> list[dict]:
             if i.get("name")
         }
 
-        # Only individual file downloads: op=access, access=part, path != "all"
         if inputs.get("op") != "access":
             continue
         if inputs.get("access") != "part":
             continue
         if inputs.get("path") == "all":
-            # "Alle Anhänge herunterladen" ZIP button — skip
             logger.debug("Skipping ZIP download button (path=all).")
             continue
 
@@ -124,32 +124,42 @@ def parse_attachments(result: SEPPMailResult) -> list[dict]:
     return attachments
 
 
-def download_attachments(result: SEPPMailResult, save_dir: str = ".") -> list[str]:
+def download_attachments(
+    result: SEPPMailResult,
+    base_dir: str = ".",
+    attachments: list[dict] | None = None,
+) -> list[str]:
     """
-    Downloads all individual PDF attachments from the decrypted email.
-    Must reuse the SEPPMailResult from decrypt_secure_email() —
-    the session contains the active server cookie.
+    Downloads all individual PDF attachments from the decrypted email into RAM,
+    then delegates sorting, renaming and duplicate-prevention to file_organizer.
+
+    Args:
+        result:      SEPPMailResult from decrypt_secure_email().
+        base_dir:    Root download directory (DOWNLOAD_DIR from .env).
+                     Files land in base_dir/DM/{year}/{type}/ or base_dir/DM/andere/.
+        attachments: Already-parsed attachments from parse_attachments(); parsed
+                     here if omitted.
 
     Returns:
         List of saved file paths.
     """
-    import os
-    os.makedirs(save_dir, exist_ok=True)
-
-    attachments  = parse_attachments(result)
+    if attachments is None:
+        attachments = parse_attachments(result)
     download_url = f"{result.base_url}/web.app"
     saved_files  = []
 
     for att in attachments:
-        logger.info("Downloading: '%s' ...", att["filename"])
+        filename = att["filename"]
+        logger.info("Downloading into RAM: '%s' ...", filename)
+
         response = result.session.post(download_url, data=att["payload"], timeout=30)
         response.raise_for_status()
 
-        save_path = os.path.join(save_dir, att["filename"])
-        with open(save_path, "wb") as f:
-            f.write(response.content)
-
-        logger.info("✓ Saved: %s (%d bytes)", save_path, len(response.content))
-        saved_files.append(save_path)
+        saved = file_organizer.organize_file(response.content, filename, base_dir)
+        if saved:
+            logger.info("[OK] %s", saved)
+            saved_files.append(saved)
+        else:
+            logger.info("  [SKIP] Existing file is newer: '%s'", filename)
 
     return saved_files

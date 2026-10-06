@@ -25,6 +25,15 @@ import logging
 import logging.handlers
 import argparse
 
+# When launched via pythonw.exe (no console attached, as the autostart updater
+# does), sys.stdout/sys.stderr are None — any print() or StreamHandler would
+# crash. Redirect them to a null stream so the rest of the code can stay
+# console-agnostic.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 # The project is split across two folders (programm/ and kalender_reader/).
 # Put both on the import path so the modules can import each other by name,
 # whether run from source or bundled into an .exe.
